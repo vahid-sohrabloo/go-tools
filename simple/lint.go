@@ -147,10 +147,7 @@ func LintLoopCopy(pass *analysis.Pass) (interface{}, error) {
 		} else {
 			return
 		}
-		r := &ast.CallExpr{
-			Fun:  &ast.Ident{Name: "copy"},
-			Args: []ast.Expr{dst, src},
-		}
+		r := edit.Call(edit.Ident("copy"), []ast.Expr{dst, src})
 		d := analysis.Diagnostic{
 			Pos:     loop.Pos(),
 			End:     loop.End(),
@@ -170,6 +167,10 @@ func LintLoopCopy(pass *analysis.Pass) (interface{}, error) {
 
 func LintIfBoolCmp(pass *analysis.Pass) (interface{}, error) {
 	fn := func(node ast.Node) {
+		if IsInTest(pass, node) {
+			return
+		}
+
 		expr := node.(*ast.BinaryExpr)
 		if expr.Op != token.EQL && expr.Op != token.NEQ {
 			return
@@ -202,10 +203,16 @@ func LintIfBoolCmp(pass *analysis.Pass) (interface{}, error) {
 		if (l1-len(r))%2 == 1 {
 			r = "!" + r
 		}
-		if IsInTest(pass, node) {
-			return
+		// XXX filter generated
+		d := analysis.Diagnostic{
+			Pos:     expr.Pos(),
+			End:     expr.End(),
+			Message: fmt.Sprintf("should omit comparison to bool constant, can be simplified to %s", r),
+			SuggestedFixes: []*analysis.SuggestedFix{
+				edit.Fix("Simplify binary expression", edit.ReplaceNodeWithText(expr, r)),
+			},
 		}
-		ReportNodefFG(pass, expr, "should omit comparison to bool constant, can be simplified to %s", r)
+		pass.Report(d)
 	}
 	pass.ResultOf[inspect.Analyzer].(*inspector.Inspector).Preorder([]ast.Node{(*ast.BinaryExpr)(nil)}, fn)
 	return nil, nil
@@ -295,11 +302,20 @@ func LintStringsContains(pass *analysis.Pass) (interface{}, error) {
 			return
 		}
 
-		prefix := ""
+		var r ast.Expr = edit.Call(edit.Selector(pkgIdent, edit.Ident(newFunc)), call.Args)
 		if !b {
-			prefix = "!"
+			r = edit.Unary(token.NOT, r)
 		}
-		ReportNodefFG(pass, node, "should use %s%s.%s(%s) instead", prefix, pkgIdent.Name, newFunc, RenderArgs(pass, call.Args))
+		d := analysis.Diagnostic{
+			Pos:     node.Pos(),
+			End:     node.End(),
+			Message: fmt.Sprintf("should use %s instead", Render(pass, r)),
+			SuggestedFixes: []*analysis.SuggestedFix{
+				edit.Fix("Replace with call to XXX", edit.ReplaceNode(pass.Fset, node, r)),
+			},
+		}
+		// XXX filter generated
+		pass.Report(d)
 	}
 	pass.ResultOf[inspect.Analyzer].(*inspector.Inspector).Preorder([]ast.Node{(*ast.BinaryExpr)(nil)}, fn)
 	return nil, nil
@@ -1787,14 +1803,14 @@ func LintSimplifyTypeSwitch(pass *analysis.Pass) (interface{}, error) {
 			return
 		}
 		x := pass.TypesInfo.ObjectOf(ident)
-		var allOffenders []ast.Node
+		var allOffenders []*ast.TypeAssertExpr
 		for _, clause := range stmt.Body.List {
 			clause := clause.(*ast.CaseClause)
 			if len(clause.List) != 1 {
 				continue
 			}
 			hasUnrelatedAssertion := false
-			var offenders []ast.Node
+			var offenders []*ast.TypeAssertExpr
 			ast.Inspect(clause, func(node ast.Node) bool {
 				assert2, ok := node.(*ast.TypeAssertExpr)
 				if !ok {
@@ -1828,11 +1844,38 @@ func LintSimplifyTypeSwitch(pass *analysis.Pass) (interface{}, error) {
 		}
 		if len(allOffenders) != 0 {
 			at := ""
+			var edits []analysis.TextEdit
+			edits = append(edits, edit.ReplaceNode(pass.Fset, expr,
+				&ast.AssignStmt{
+					Lhs: []ast.Expr{assert.X},
+					Tok: token.DEFINE,
+					Rhs: []ast.Expr{assert},
+				}))
 			for _, offender := range allOffenders {
+				edits = append(edits, analysis.TextEdit{
+					// FIXME(dh): we have no direct way of determining
+					// the position of the dot in `x.(T)` – in
+					// gofmt'ed code, Lparen-1 is a good enough guess.
+					Pos:     offender.Lparen - 1,
+					End:     offender.Rparen + 1,
+					NewText: []byte{},
+				})
+
 				pos := lint.DisplayPosition(pass.Fset, offender.Pos())
 				at += "\n\t" + pos.String()
 			}
-			ReportNodefFG(pass, expr, "assigning the result of this type assertion to a variable (switch %s := %s.(type)) could eliminate the following type assertions:%s", Render(pass, ident), Render(pass, ident), at)
+			d := analysis.Diagnostic{
+				Pos:     expr.Pos(),
+				End:     expr.End(),
+				Message: fmt.Sprintf("assigning the result of this type assertion to a variable (switch %s := %s.(type)) could eliminate the following type assertions:%s", Render(pass, ident), Render(pass, ident), at),
+				// FIXME(dh): the suggested fix is incorrect if any
+				// branch assigns to the variable, because the fix
+				// would shadow the variable
+				SuggestedFixes: []*analysis.SuggestedFix{
+					edit.Fix("Replace type assertions with variable", edits...),
+				},
+			}
+			pass.Report(d)
 		}
 	}
 	pass.ResultOf[inspect.Analyzer].(*inspector.Inspector).Preorder([]ast.Node{(*ast.TypeSwitchStmt)(nil)}, fn)
