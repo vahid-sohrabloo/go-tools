@@ -11,6 +11,8 @@ import (
 	"text/tabwriter"
 
 	"honnef.co/go/tools/lint"
+
+	"golang.org/x/tools/go/analysis"
 )
 
 func shortPath(path string) string {
@@ -77,11 +79,12 @@ func (o JSON) Format(p lint.Problem) {
 		Column int    `json:"column"`
 	}
 	jp := struct {
-		Code     string   `json:"code"`
-		Severity string   `json:"severity,omitempty"`
-		Location location `json:"location"`
-		End      location `json:"end"`
-		Message  string   `json:"message"`
+		Code           string   `json:"code"`
+		Severity       string   `json:"severity,omitempty"`
+		Location       location `json:"location"`
+		End            location `json:"end"`
+		Message        string   `json:"message"`
+		SuggestedFixes []*analysis.SuggestedFix
 	}{
 		Code:     p.Check,
 		Severity: severity(p.Severity),
@@ -95,9 +98,13 @@ func (o JSON) Format(p lint.Problem) {
 			Line:   p.End.Line,
 			Column: p.End.Column,
 		},
-		Message: p.Message,
+		Message:        p.Message,
+		SuggestedFixes: p.SuggestedFixes,
 	}
-	_ = json.NewEncoder(o.W).Encode(jp)
+	err := json.NewEncoder(o.W).Encode(jp)
+	if err != nil {
+		panic(fmt.Sprintf("internal error: %v", err))
+	}
 }
 
 type Stylish struct {

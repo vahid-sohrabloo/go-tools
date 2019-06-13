@@ -16,6 +16,7 @@ import (
 	"golang.org/x/tools/go/ast/inspector"
 	"golang.org/x/tools/go/types/typeutil"
 	. "honnef.co/go/tools/arg"
+	"honnef.co/go/tools/edit"
 	"honnef.co/go/tools/internal/passes/buildssa"
 	"honnef.co/go/tools/internal/sharedcheck"
 	"honnef.co/go/tools/lint"
@@ -54,7 +55,18 @@ func LintSingleCaseSelect(pass *analysis.Pass) (interface{}, error) {
 			if !isSingleSelect(v) {
 				return
 			}
-			ReportNodefFG(pass, node, "should use a simple channel send/receive instead of select with a single case")
+			d := analysis.Diagnostic{
+				Pos:     v.Pos(),
+				End:     v.End(),
+				Message: "should use a simple channel send/receive instead of select with a single case",
+				SuggestedFixes: []*analysis.SuggestedFix{
+					edit.Fix("Convert select to channel send/receive", edit.ReplaceNode(pass.Fset, v, v.Body.List[0].(*ast.CommClause).Comm)),
+				},
+			}
+			// XXX filter generated
+			// FIXME(dh): the replacement doesn't take scopes/shadowing into account.
+			pass.Report(d)
+			//ReportNodefFG(pass, node, "should use a simple channel send/receive instead of select with a single case")
 		}
 	}
 	pass.ResultOf[inspect.Analyzer].(*inspector.Inspector).Preorder([]ast.Node{(*ast.ForStmt)(nil), (*ast.SelectStmt)(nil)}, fn)
@@ -107,6 +119,8 @@ func LintLoopCopy(pass *analysis.Pass) (interface{}, error) {
 			return
 		}
 
+		dst := lhs
+		var src ast.Expr
 		if rhs, ok := stmt.Rhs[0].(*ast.IndexExpr); ok {
 			rx, ok := rhs.X.(*ast.Ident)
 			_ = rx
@@ -120,6 +134,7 @@ func LintLoopCopy(pass *analysis.Pass) (interface{}, error) {
 			if pass.TypesInfo.ObjectOf(ridx) != pass.TypesInfo.ObjectOf(key) {
 				return
 			}
+			src = rhs
 		} else if rhs, ok := stmt.Rhs[0].(*ast.Ident); ok {
 			value, ok := loop.Value.(*ast.Ident)
 			if !ok {
@@ -128,10 +143,26 @@ func LintLoopCopy(pass *analysis.Pass) (interface{}, error) {
 			if pass.TypesInfo.ObjectOf(rhs) != pass.TypesInfo.ObjectOf(value) {
 				return
 			}
+			src = rhs
 		} else {
 			return
 		}
-		ReportNodefFG(pass, loop, "should use copy() instead of a loop")
+		r := &ast.CallExpr{
+			Fun:  &ast.Ident{Name: "copy"},
+			Args: []ast.Expr{dst, src},
+		}
+		d := analysis.Diagnostic{
+			Pos:     loop.Pos(),
+			End:     loop.End(),
+			Message: "should use copy() instead of a loop",
+			SuggestedFixes: []*analysis.SuggestedFix{
+				edit.Fix("Convert to copy()", edit.ReplaceNode(pass.Fset, loop, r)),
+			},
+		}
+		pass.Report(d)
+		// XXX filter generated
+		// FIXME(dh): we should check whether copy is shadowed
+		// ReportNodefFG(pass, loop, "should use copy() instead of a loop")
 	}
 	pass.ResultOf[inspect.Analyzer].(*inspector.Inspector).Preorder([]ast.Node{(*ast.RangeStmt)(nil)}, fn)
 	return nil, nil

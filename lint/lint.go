@@ -114,11 +114,12 @@ const (
 
 // Problem represents a problem in some source code.
 type Problem struct {
-	Pos      token.Position
-	End      token.Position
-	Message  string
-	Check    string
-	Severity Severity
+	Pos            token.Position
+	End            token.Position
+	Message        string
+	Check          string
+	Severity       Severity
+	SuggestedFixes []*analysis.SuggestedFix
 }
 
 func (p *Problem) String() string {
@@ -352,12 +353,14 @@ func (l *Linter) Lint(cfg *packages.Config, patterns []string) ([]Problem, error
 
 	var out []Problem
 	out = append(out, problems[0])
+	// XXX
 	for i, p := range problems[1:] {
 		// We may encounter duplicate problems because one file
 		// can be part of many packages.
-		if problems[i] != p {
-			out = append(out, p)
-		}
+		// if problems[i] != p {
+		out = append(out, p)
+		//}
+		_ = i
 	}
 	return out, nil
 }
