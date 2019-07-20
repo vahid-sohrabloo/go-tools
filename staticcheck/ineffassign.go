@@ -1,5 +1,7 @@
 package staticcheck
 
+// TODO(dh): consider implementing this on top of the naive SSA form
+
 import (
 	"fmt"
 	"go/ast"
@@ -47,6 +49,8 @@ type ineffassign struct {
 	blocks       []*ineffBlock
 	namedReturns []types.Object
 	hasDefer     bool
+	// set of idents on the lhs of a channel receive in a select statement
+	selectAssignments map[*ast.Ident]struct{}
 
 	idCnt int
 }
@@ -237,7 +241,21 @@ func (ineff *ineffassign) process(pass *analysis.Pass, node ast.Node) {
 		}
 	}
 
+	// find all assignments made in select statements
+	ineff.selectAssignments = map[*ast.Ident]struct{}{}
+	ast.Inspect(node, func(node ast.Node) bool {
+		if comm, ok := node.(*ast.CommClause); ok {
+			if assign, ok := comm.Comm.(*ast.AssignStmt); ok {
+				if ident, ok := assign.Lhs[0].(*ast.Ident); ok {
+					ineff.selectAssignments[ident] = struct{}{}
+				}
+			}
+		}
+		return true
+	})
+
 	for _, b := range g.Blocks {
+		// OPT(dh): can we skip dead blocks?
 		ineff.processBlock(b)
 	}
 
@@ -393,7 +411,20 @@ func (ineff *ineffassign) processBlock(cb *cfg.Block) {
 		})
 	}
 
-	for _, n := range cb.Nodes {
+	start := 0
+	if len(cb.Nodes) > 0 {
+		if ident, ok := cb.Nodes[0].(*ast.Ident); ok {
+			if _, ok := ineff.selectAssignments[ident]; ok {
+				// This block is the body of a CommClause of the form x =
+				// <-x. We didn't process the assignment when we saw it;
+				// instead we need to inject it at the front of the body.
+				b.def(ident, ineff.id())
+				start = 1
+			}
+		}
+	}
+
+	for _, n := range cb.Nodes[start:] {
 		if e, ok := n.(*ast.ExprStmt); ok {
 			n = e.X
 		}
@@ -427,18 +458,55 @@ func (ineff *ineffassign) processBlock(cb *cfg.Block) {
 				}
 				markReadIdents(n.Lhs[0])
 			}
+
+			var isSelect bool
+			if ident, ok := n.Lhs[0].(*ast.Ident); ok {
+				_, isSelect = ineff.selectAssignments[ident]
+			}
 			for i, lhs := range n.Lhs {
 				if ident, ok := unparen(lhs).(*ast.Ident); ok {
-					b.def(ident, ineff.id())
-					if len(n.Lhs) == len(n.Rhs) {
-						if v, ok := n.Rhs[i].(*ast.Ident); ok && ineff.pass.TypesInfo.ObjectOf(v) == types.Universe.Lookup("nil") {
-							// assigning nil to a value is sometimes seen as a hint to the garbage collector.
+					if !isSelect {
+						// If these assignments are the CommClauses of a
+						// select statement, then only the Rhs comes into
+						// effect at this point. The actual assignment only
+						// happens if the respective case gets entered.
+						//
+						// The go/cfg package cannot model the semantics of
+						// select and produces the following kind of control
+						// flow for select statements:
+						//
+						// 	.0: # entry
+						// 		x byte
+						// 		x = <-ch1
+						// 		x = <-ch2
+						// 		succs: 2 3
+						//
+						// 	.2: # select.body
+						// 		x
+						// 		println(x)
+						// 		succs: 1
+						//
+						// If we interpreted the control flow as presented by
+						// go/cfg, we'd claim that x = <- ch1 is an
+						// ineffective assignment.
+						//
+						// To work around this, we omit the x = <-ch1
+						// assignment in the original block and
+						// instead only emit a use on ch1. Similarly,
+						// in the select.body block, we omit the use
+						// of x, and instead omit a definition of x.
+
+						b.def(ident, ineff.id())
+						if len(n.Lhs) == len(n.Rhs) {
+							if v, ok := n.Rhs[i].(*ast.Ident); ok && ineff.pass.TypesInfo.ObjectOf(v) == types.Universe.Lookup("nil") {
+								// assigning nil to a value is sometimes seen as a hint to the garbage collector.
+								markReadIdents(ident)
+							}
+						}
+
+						if len(n.Lhs) == len(n.Rhs) && n.Tok == token.DEFINE && isZeroLiteral(ineff.pass, n.Rhs[i]) {
 							markReadIdents(ident)
 						}
-					}
-
-					if len(n.Lhs) == len(n.Rhs) && n.Tok == token.DEFINE && isZeroLiteral(ineff.pass, n.Rhs[i]) {
-						markReadIdents(ident)
 					}
 				} else {
 					// the lhs is not an ident, so it may be an array
