@@ -8,7 +8,6 @@ import (
 	"go/token"
 	"go/types"
 	htmltemplate "html/template"
-	"log"
 	"net/http"
 	"reflect"
 	"regexp"
@@ -2119,13 +2118,10 @@ func CheckIneffectiveAppend(pass *analysis.Pass) (interface{}, error) {
 						case *ssa.Sigma:
 							walkRefs(*ref.Referrers())
 						case ssa.Value:
-							if isAppend(ref) {
-								for _, ret := range ssautil.CallResult(ref.(*ssa.Call)) {
-									walkRefs(*ret.Referrers())
-								}
-							} else {
+							if !isAppend(ref) {
 								isUsed = true
-								break loop
+							} else {
+								walkRefs(*ref.Referrers())
 							}
 						case ssa.Instruction:
 							isUsed = true
@@ -2134,9 +2130,11 @@ func CheckIneffectiveAppend(pass *analysis.Pass) (interface{}, error) {
 					}
 				}
 
-				for _, ret := range ssautil.CallResult(val.(*ssa.Call)) {
-					walkRefs(*ret.Referrers())
+				refs := val.Referrers()
+				if refs == nil {
+					continue
 				}
+				walkRefs(*refs)
 
 				if !isUsed {
 					pass.Reportf(ins.Pos(), "this result of append is never used, except maybe in other appends")
@@ -2325,7 +2323,7 @@ func CheckDeferLock(pass *analysis.Pass) (interface{}, error) {
 
 func CheckNaNComparison(pass *analysis.Pass) (interface{}, error) {
 	isNaN := func(v ssa.Value) bool {
-		call, ok := ssautil.IsCallResult(v)
+		call, ok := v.(*ssa.Call)
 		if !ok {
 			return false
 		}
@@ -2419,7 +2417,6 @@ func CheckLeakyTimeTick(pass *analysis.Pass) (interface{}, error) {
 				if !ok || !IsCallTo(call.Common(), "time.Tick") {
 					continue
 				}
-				log.Println(call.Parent(), functions.Terminates(call.Parent()))
 				if !functions.Terminates(call.Parent()) {
 					continue
 				}
@@ -2670,6 +2667,10 @@ fnLoop:
 				if !ok {
 					continue
 				}
+				refs := ins.Referrers()
+				if refs == nil || len(FilterDebug(*refs)) > 0 {
+					continue
+				}
 
 				callee := ins.Common().StaticCallee()
 				if callee == nil {
@@ -2679,30 +2680,9 @@ fnLoop:
 					// TODO(dh): support anonymous functions
 					continue
 				}
-				if _, ok := pure[callee.Object().(*types.Func)]; !ok {
-					continue
+				if _, ok := pure[callee.Object().(*types.Func)]; ok {
+					pass.Reportf(ins.Pos(), "%s is a pure function but its return value is ignored", callee.Name())
 				}
-
-				switch ins.Common().Signature().Results().Len() {
-				case 0:
-					panic("unreachable")
-				case 1:
-					res := ssautil.CallResult(ins)
-					if len(res) != 1 {
-						continue
-					}
-					refs := res[0].Referrers()
-					if refs == nil || len(FilterDebug(*refs)) > 0 {
-						continue
-					}
-				default:
-					retv := ins.Common().Results
-					refs := retv.Referrers()
-					if refs == nil || len(FilterDebug(*refs)) > 0 {
-						continue
-					}
-				}
-				pass.Reportf(ins.Pos(), "%s is a pure function but its return value is ignored", callee.Name())
 			}
 		}
 	}
@@ -3165,53 +3145,50 @@ func CheckTimerResetReturnValue(pass *analysis.Pass) (interface{}, error) {
 				if !IsCallTo(call.Common(), "(*time.Timer).Reset") {
 					continue
 				}
-				results := ssautil.CallResult(call)
-				for _, res := range results {
-					refs := res.Referrers()
-					if refs == nil {
+				refs := call.Referrers()
+				if refs == nil {
+					continue
+				}
+				for _, ref := range FilterDebug(*refs) {
+					ifstmt, ok := ref.(*ssa.If)
+					if !ok {
 						continue
 					}
-					for _, ref := range FilterDebug(*refs) {
-						ifstmt, ok := ref.(*ssa.If)
-						if !ok {
+
+					found := false
+					for _, succ := range ifstmt.Block().Succs {
+						if len(succ.Preds) != 1 {
+							// Merge point, not a branch in the
+							// syntactical sense.
+
+							// FIXME(dh): this is broken for if
+							// statements a la "if x || y"
 							continue
 						}
-
-						found := false
-						for _, succ := range ifstmt.Block().Succs {
-							if len(succ.Preds) != 1 {
-								// Merge point, not a branch in the
-								// syntactical sense.
-
-								// FIXME(dh): this is broken for if
-								// statements a la "if x || y"
-								continue
+						ssautil.Walk(succ, func(b *ssa.BasicBlock) bool {
+							if !succ.Dominates(b) {
+								// We've reached the end of the branch
+								return false
 							}
-							ssautil.Walk(succ, func(b *ssa.BasicBlock) bool {
-								if !succ.Dominates(b) {
-									// We've reached the end of the branch
+							for _, ins := range b.Instrs {
+								// TODO(dh): we should check that
+								// we're receiving from the channel of
+								// a time.Timer to further reduce
+								// false positives. Not a key
+								// priority, considering the rarity of
+								// Reset and the tiny likeliness of a
+								// false positive
+								if ins, ok := ins.(*ssa.Recv); ok && IsType(ins.Chan.Type(), "<-chan time.Time") {
+									found = true
 									return false
 								}
-								for _, ins := range b.Instrs {
-									// TODO(dh): we should check that
-									// we're receiving from the channel of
-									// a time.Timer to further reduce
-									// false positives. Not a key
-									// priority, considering the rarity of
-									// Reset and the tiny likeliness of a
-									// false positive
-									if ins, ok := ins.(*ssa.Recv); ok && IsType(ins.Chan.Type(), "<-chan time.Time") {
-										found = true
-										return false
-									}
-								}
-								return true
-							})
-						}
+							}
+							return true
+						})
+					}
 
-						if found {
-							pass.Reportf(call.Pos(), "it is not possible to use Reset's return value correctly, as there is a race condition between draining the channel and the new timer expiring")
-						}
+					if found {
+						pass.Reportf(call.Pos(), "it is not possible to use Reset's return value correctly, as there is a race condition between draining the channel and the new timer expiring")
 					}
 				}
 			}
